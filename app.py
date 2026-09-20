@@ -1255,6 +1255,17 @@ def _cache_put(key, value):
 # 结论：与其去猜旧状态哪里坏了，不如**续播时把旧状态全部丢掉，
 # 走一条和全新播放一模一样的路**。状态空间直接坍缩，玄学无处藏身。
 RESUME_IDLE_GAP = 180      # 距上次来要链超过这么久 → 判为续播
+# 【v2.2.25】距上次**成功交链**不到这么久 → 绝不可能是续播（人家正在看）。
+#
+# 为什么需要它：Trace 兜底（无记录 + 起播请求 + 有痕迹 → 续播）会被
+# 播放器的缓冲请求反复触发。播放器缓冲时发 bytes=0-0，服务端有链在
+# 缓存里 —— 两个条件就齐了。而判成续播会清掉探测节流，导致探测真的
+# 打出去、海外线路探不到、误判坏链、换文件、**跳回起播点**。
+#
+# 75 秒的取值依据：正常播放中，播放器每隔几秒到几十秒就要一次链
+# （诊断里看到 1~5 秒一次）；跨过 75 秒还没人来，才够得上"停过一阵"。
+# 真续播通常是几十分钟到隔夜，离 75 秒远得很，不会被误伤。
+RESUME_RECENT_SERVED = 75
 _last_served = {}          # file_id -> 上次成功交链的时刻
 _last_served_lock = threading.Lock()
 # 每个片子**每一次**来请求的时刻（不管成没成）。用来算「距上次请求隔了多久」——
@@ -1354,16 +1365,35 @@ def _mark_served(file_id):
 def _is_playback_start():
     """这条请求是不是「一次播放会话的开头」。
 
-    播放器起播时发的第一条请求，要么不带 Range，要么就是 bytes=0-0
-    （只问文件大小，不取数据）。这两种都没有真实的数据偏移，是
-    「会话开始」的标志。
+    【v2.2.25 关键修复 —— 原来的判据把「播放中的缓冲请求」也放行了】
 
-    【v2.2.22 新增】用来把「续播的第一条请求」从一堆请求里认出来。
+    以前这里把 `bytes=0-0` / `bytes=0-1` 也算「起播」。理由是"它们
+    没有真实数据偏移，说明会话刚开始"。**这个理由是错的。**
+
+    `bytes=0-0` 是 HTML5 播放器**在播放全程反复发**的一种请求：它想
+    知道文件有多大、能不能 seek，所以每次重新缓冲、每次切清晰度、
+    每次 seek 之后都会来一条。它跟"起播"长得一模一样，但**含义完全
+    不同**。
+
+    它进了「起播」名单，就给了 Trace 兜底（见 _is_resume 第二条）一个
+    随时可触发的入口 —— 播放器每缓冲一次，服务端就判一次「续播」，
+    而判成续播会**清掉探测节流**（见 _get_cas_link_inner 的 resume 分支），
+    于是下一次探测真的打了出去。海外服务器跨国际线路探国内 CDN
+    经常探不到 → 误判成坏链 → 重建/换文件 → **播放器手上那条链当场
+    失效 → 跳回起播点**。
+
+    用户实测（斗破苍穹 S00E02，16:45 那一串）与之完全吻合：
+    09 秒、11 秒、15 秒一路正常拉到 20MB，**16 秒突然来一条
+    `bytes=0-0` 被判成「续播」**，紧接着就出事。
+
+    现在只认真正的会话开头：**完全不带 Range**（首条请求），或
+    `bytes=0-`（明确表示"从 0 开始取到底"）。
+    `bytes=0-0` / `bytes=0-1` 是探测，不是起播，一律不算。
     """
     rng = (request.headers.get("Range") or "").strip().lower()
     if not rng:
         return True
-    return rng in ("bytes=0-0", "bytes=0-1", "bytes=0-")
+    return rng == "bytes=0-"
 
 
 _resume_why = threading.local()   # 这次请求的续播判定依据（"gap" / "trace"）
@@ -1437,8 +1467,32 @@ def _is_resume(file_id, gap=None, use_cas=False):
     if gap and gap > RESUME_IDLE_GAP:
         _resume_why.reason = "gap"
         return True
-    # 二、没记录：有痕迹 + 起播请求 → 也是续播
+    # 二、没记录：有痕迹 + 起播请求 + **最近没刚交过链** → 也是续播
+    #
+    # 【v2.2.25 新增第三道闸：刚交过链就不是续播】
+    #
+    # 前两道闸（起播请求 + 服务端有痕迹）挡不住"播放中的缓冲请求"：
+    # 播放器缓冲时发的 bytes=0-0，在服务端看来跟起播没区别，而服务端
+    # 当然有痕迹（链就在缓存里）。两个条件同时命中 → 判成续播 →
+    # 清掉探测节流 → 探测误判 → 换文件 → **跳回起播点**。
+    #
+    # 真·续播有一个铁定的特征：**这个人已经很久没来要过链了**。
+    # 而"刚交过链"（几十秒内）说明人家正在看着呢，这是同一个播放会话
+    # 里的一次缓冲，绝不可能是续播。
+    #
+    # 用 _last_served（上次成功交链的时刻）来判：它只在真正把链交出去
+    # 之后才写，比 _last_seen（每个请求都写）更能代表"有人在看"。
     if not gap and _is_playback_start() and _has_server_trace(file_id, use_cas):
+        with _last_served_lock:
+            served = _last_served.get(file_id)
+        since = int(time.time() - served) if served else -1
+        if served and since < RESUME_RECENT_SERVED:
+            # 刚交过链 → 人家正在看，这不是续播，是同一会话里的缓冲请求
+            app.logger.info(
+                "trace 兜底被拦下（%d 秒前刚交过链，属同一播放会话）file=%s",
+                max(since, 0), file_id[:12])
+            _resume_why.reason = ""
+            return False
         app.logger.info(
             "续播判定兜底命中（无记录但有痕迹）file=%s cas=%s",
             file_id[:12], use_cas)
@@ -1713,18 +1767,37 @@ def _get_cas_link_inner(client, cfg, file_id, cas_name, resume=False):
             app.logger.info("重签链接失败（%s）: %s", cas_name, exc)
         if fresh:
             url = fresh
+            _play_meta.restored = False       # 同一个文件，没换
             app.logger.info(
                 "直链探测判坏，已对同一文件（%s）重签新链，未删文件: %s",
                 temp_id, cas_name)
         else:
-            # 连重签都拿不到链接：这时才怀疑文件真没了，走重建。
-            # 重建前**不** forget_session —— 那会让清扫把这部片子的其它
-            # 副本一起删掉，而播放器可能正用着它们。
+            # 【v2.2.25 —— 这里也**不删文件**，把最后一条会跳回的路堵死】
+            #
+            # v2.2.23 把"探测判坏"从"删文件重建"改成了"对同一文件重签"，
+            # 但重签失败时**仍然**走了 delete_quietly + fetch_link。这是
+            # 302 架构下最后一个能造成"跳回起播点"的出口：
+            #
+            #   重签失败（海外线路抖动、云盘接口短暂抽风都会）→ 删掉文件
+            #   → 播放器手上那条链当场变死 → 跳回 0 秒
+            #
+            # 而"重签失败"根本**不能证明文件没了**：refresh_link 只是去
+            # 要一条新签名，它失败可能纯粹是网络抖了一下。拿它当"文件已
+            # 死"的证据，代价却是用户跳回起点，完全不成比例。
+            #
+            # 正确做法：**照旧把手上这条链交出去**（它这会儿还没过期，
+            # 而且我们刚刚才验过——能验到坏说明至少探到过响应），同时
+            # 把文件寿命往后延。等下一个请求再来，重签还有机会；
+            # 真到链过期了，下面"链快到期/已坏死"的分支会接管。
+            #
+            # 一句话：**宁可交一条存疑的链，也绝不删文件。**
+            _play_meta.restored = False       # 同一个文件，没换
             app.logger.warning(
-                "重签链接也失败（%s），文件可能真没了，重新秒传还原", cas_name)
-            restorer.delete_quietly(temp_id)
-            url, size, temp_id, real_name, restored = restorer.fetch_link(
-                file_id, cas_name)
+                "重签链接失败（%s），仍交出旧链并延长文件寿命，不删文件重建",
+                cas_name)
+            restorer.schedule_delete(
+                temp_id, delay=max(int(restorer.temp_ttl or 0),
+                                   int(CAS_TEMP_MIN_TTL), CAS_TEMP_GRACE + 300))
     expire = _link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL)
     # 临时文件必须活过缓存：缓存失效后再宽限 CAS_TEMP_GRACE 秒。
     # 不能只看 cas_temp_ttl —— 直链 15 分钟后才过期，这期间播放器拿着旧直链

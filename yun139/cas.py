@@ -690,8 +690,42 @@ class CASRestorer:
         try:
             return self.client.personal_get_link(temp_id) or ""
         except Exception as exc:
-            logger.info("复用临时文件 %s 取直链失败，将重新还原: %s", temp_id, exc)
+            logger.info("复用临时文件 %s 取直链失败: %s", temp_id, exc)
             return ""
+
+    def _refresh_link_retry(self, temp_id, attempts=3):
+        """【v2.2.25】重签直链 + 重试，把「网络抖动」和「文件真没了」分开。
+
+        为什么必须区分：取直链接口是**一次网络调用**，在海外服务器上
+        跨国际线路访问，抖动、超时、502 都很常见。以前只要它抛一次异常
+        就当场判定"文件没了"→ 丢弃会话 → 走全新秒传 → **换文件** →
+        播放器手上那条链指向的旧文件被顶替 → **跳回起播点**。
+
+        而"取链失败"和"文件不存在"完全是两码事：文件在不在要问云盘
+        的文件列表（_temp_file_exists，那才是权威判断），不该由一次
+        网络异常来回答。
+
+        所以这里先重试几次（退避 0.4s / 1.2s）；全失败再返回空串，
+        交给上层。上层拿到空串**也不立刻换文件**（见 fetch_link），
+        而是再单独确认一次文件存在性 —— 确认还在就沿用旧链。
+
+        返回 (直链, 是否确定文件已不存在)。
+        """
+        self._last_refresh_missing = False
+        for i in range(max(1, attempts)):
+            link = self._refresh_link(temp_id)
+            if link:
+                return link, False
+            # 重试前先单独确认文件还在不在 —— 这是权威判断，一次就够
+            if i == 0 and not self._temp_file_exists(temp_id):
+                # 云盘明确说文件没了，重试无意义
+                logger.info("临时文件 %s 已不在云盘，判定为确实不存在", temp_id)
+                self._last_refresh_missing = True
+                return "", True
+            if i < attempts - 1:
+                time.sleep(0.4 * (3 ** i))     # 0.4s → 1.2s
+        # 重试全失败、但文件存在性没被否定 → 是网络问题，不是文件问题
+        return "", False
 
     def refresh_link(self, temp_id):
         """对外：**只换链接、不换文件**。
@@ -904,14 +938,34 @@ class CASRestorer:
 
         每次成功复用都把会话寿命往后推（滑动续期）：连续播放时一个临时
         文件可以一直用下去，只在停止播放、没人续期之后才自然过期被清理，
-        下次续播再全新秒传。取不到链说明文件已不在，丢弃会话改走秒传。
+        下次续播再全新秒传。
+
+        【v2.2.25 —— 取链失败不再等同于"文件没了"】
+        以前这里是「取链失败 → 丢会话 → 返回空 → 上层换文件」，而取链
+        只是一次网络调用，海外服务器上抖一下就会失败。于是"网络抖一下"
+        被当成了"文件没了"，直接导致换文件、播放器跳回起播点。
+
+        现在改成：
+          * 重试几次（网络抖动多半就好了）；
+          * 重试仍失败时，**只有云盘明确说文件不存在**才丢会话；
+          * 文件还在（只是取链接口不通）→ **沿用会话**，返回空串让上层
+            用别的路（旧链）兜住，绝不因为一次接口抖动就换文件。
         """
-        link = self._refresh_link(sess["temp_id"])
+        link, missing = self._refresh_link_retry(sess["temp_id"])
         if not link:
-            self._drop_session(cas_file_id)
+            if missing:
+                # 云盘的权威判断：文件真没了 → 丢会话，换文件是对的
+                logger.info("复用失败且文件确实不存在，丢弃会话: %s", cas_name)
+                self._drop_session(cas_file_id)
+                return ""
+            # 文件还在，只是取链接口不通 → 保留会话（下次还能复用），
+            # 返回空串让上层酌情沿用旧链
+            logger.warning(
+                "复用取链失败但文件仍在云盘，保留会话不换文件: %s", cas_name)
             return ""
         with self._state_lock:
             sess["created_at"] = time.time()      # 滑动续期
+            sess["last_link"] = link              # 记下可用链，供接口抖动时兜底
         logger.info("复用临时文件换直链（未重新秒传）: %s", cas_name)
         return link
 
@@ -963,6 +1017,30 @@ class CASRestorer:
                 link = self._reuse_link(cas_file_id, cas_name, sess)
                 if link:
                     return link, sess["size"], sess["temp_id"], sess["name"], False
+                # 【v2.2.25 总闸】走到这里 = 复用这条路的两次尝试都没拿到链。
+                # 但如果**文件还在云盘里**，那问题出在「取链接口」而不是
+                # 「文件」—— 这时候去重新秒传，会用一个新文件顶替掉旧文件，
+                # 而播放器手里那条指向旧文件的链当场变死 → **跳回起播点**。
+                #
+                # 铁律：**只要文件还在，就绝不换文件。**
+                #
+                # 兜底手段：把这个会话**上一次成功签发的直链**交出去。
+                # 那条链多半还没过期（有效期 15 分钟），播放器拿它能接着播；
+                # 就算已过期，也比"换文件导致跳回起点"强 —— 前者是一次
+                # 重试就能好，后者是实打实的中断。下次请求来时接口恢复了，
+                # 自然就走正常复用了。
+                if self._temp_file_exists(sess["temp_id"]):
+                    stale = sess.get("last_link") or ""
+                    logger.warning(
+                        "复用取链失败但文件仍在，沿用上次的链不换文件: %s",
+                        cas_name)
+                    if stale:
+                        return (stale, sess["size"], sess["temp_id"],
+                                sess["name"], False)
+                    raise CASError(
+                        "临时文件存在但暂时取不到直链（云盘接口抖动），"
+                        "已保留原文件，请稍后重试"
+                    )
 
             link, size, temp_id, real_name, base_name = self.restore_temp(
                 cas_file_id, cas_name
@@ -984,6 +1062,7 @@ class CASRestorer:
                     "base_name": base_name,
                     "size": size,
                     "created_at": time.time(),
+                    "last_link": link,     # 供"取链接口抖动"时兜底（v2.2.25）
                 }
             # 清扫旧副本放后台：点「下一集」这类冷启动请求，
             # 返回前的每次同步接口调用都在给播放器的超时添筹码

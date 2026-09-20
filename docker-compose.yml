@@ -1,7 +1,7 @@
 name: 139strm
 services:
   139strm:
-    image: tianjian518/139strm:2.2.24     # 如需从源码构建，把这行换成：build: .
+    image: tianjian518/139strm:2.2.25     # 如需从源码构建，把这行换成：build: .
     container_name: 139strm
     restart: unless-stopped
     ports:
