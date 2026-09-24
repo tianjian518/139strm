@@ -10,6 +10,7 @@
 """
 
 import base64
+import logging
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -18,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from . import crypto
+
+logger = logging.getLogger(__name__)
 
 # 当前线程的云盘接口总时限（见 Yun139Client.set_deadline）。
 # 用 thread-local 而不是实例属性：client 是按账号缓存、多线程共用的，
@@ -135,7 +138,7 @@ class Yun139Client:
                  mail_cookies="", username="", cloud_id="", timeout=(6, 12)):
         """timeout 默认 (连接 6 秒, 读取 12 秒)。
 
-        【v2.2.22 重要修复】以前这里是 30 —— 单次接口调用最多能挂 30 秒。
+        【v2.2.23 重要修复】以前这里是 30 —— 单次接口调用最多能挂 30 秒。
         而一次冷启动续播要跟云盘打 9 个来回，只要有两次撞上线路抖动，
         用户就要干等 60 秒以上，播放器全程转圈（用户原话：「加载 1 分钟
         都不播放」）。国内本地部署感觉不到，海外服务器（甲骨文）跨国际
@@ -183,7 +186,7 @@ class Yun139Client:
                     "请重试（重试会快很多）")
             # 单次调用的超时必须**跟着总时限收缩**。
             #
-            # 【v2.2.22 修】原来这里只检查"总时限过了没有"，不收缩单次超时：
+            # 【v2.2.23 修】原来这里只检查"总时限过了没有"，不收缩单次超时：
             # 总时限还剩 3 秒时发起的那一次调用，照样按默认的 12 秒等着，
             # 于是整个请求实际能拖到 25 + 12 ≈ 37 秒 —— 比承诺的 25 秒更久。
             # 现在把本次超时压到"剩下的总时间"，总时限成了真正的硬上限。
@@ -247,10 +250,45 @@ class Yun139Client:
         except Exception:
             return None
 
+    def token_remain_ms(self):
+        """令牌还剩多少毫秒到期；解析不出来返回 None。
+
+        【v2.2.23】抽出来给"刷新失败要不要判死"用 —— 判断令牌到底能不能用，
+        必须**直接看它的过期时间**，不能靠"刷新接口通不通"来推断。
+        """
+        try:
+            _, _, token = self._split_authorization()
+            strs = token.split("|")
+            if len(strs) < 4:
+                return None
+            return int(strs[3]) - time.time() * 1000
+        except Exception:
+            return None
+
     def refresh_token(self):
         """
         令牌剩余有效期超过 15 天时官方不做刷新；过期前会调用刷新接口续期。
         返回 True 表示凭据发生了更新。
+
+        【v2.2.23 —— 修「令牌莫名失效、过一阵又自己好了」】
+
+        用户实测：界面上报「Authorization 已过期，请重新获取」连续 6 次，
+        但把**同一条老令牌**重新填一遍就好了；解码令牌一看，它离到期还有
+        15.2 天，压根没过期。
+
+        病根有两处，都在这个函数里：
+
+        一、**刷新接口失败 = 判死。** 甲骨文在海外，刷新接口
+            (aas.caiyun.feixin.10086.cn) 走跨国际线路，抖一下就
+            raise_for_status 抛异常。而这条链一路抛到播放接口，用户看到
+            的就是「已过期」—— 令牌明明还能用 15 天。
+            真实原因和报出来的原因完全是两码事，把用户和自己都骗了。
+            现在：**刷新失败先看令牌本身还能不能用**。还能用（剩余 > 0）
+            就照常放行，只是记一条日志；真过期了才往下走兜底。
+
+        二、**剩 0 秒那一下直接抛错，不给任何补救机会。** 现在改成
+            交给上层（app.py 的 _ensure_valid_auth）去走 Cookie 兜底登录，
+            那条路走不通才把错误抛出来。
         """
         prefix, account, token = self._split_authorization()
         self.account = account
@@ -266,34 +304,43 @@ class Yun139Client:
         remain = expiration - time.time() * 1000
         if remain > 1000 * 60 * 60 * 24 * 15:
             return False          # 还很新，无需刷新
+
+        # 刷新接口只对"还没到期但快到期"的令牌有意义；已过期时官方也不给刷，
+        # 直接抛出去让上层走兜底登录（Cookie / 重新填令牌）。
         if remain < 0:
             raise Yun139Error("Authorization 已过期，请重新获取")
 
         url = "https://aas.caiyun.feixin.10086.cn:443/tellin/authTokenRefresh.do"
         body = ("<root><token>" + token + "</token><account>" + account +
                 "</account><clienttype>656</clienttype></root>")
-        resp = self._session.post(
-            url, data=body.encode("utf-8"), timeout=self.timeout,
-            headers={"Content-Type": "application/xml"},
-        )
-        resp.raise_for_status()
+        # 【v2.2.23】刷新接口的失败**必须和"令牌失效"分开对待** —— 见上面注释。
         try:
+            resp = self._session.post(
+                url, data=body.encode("utf-8"), timeout=self.timeout,
+                headers={"Content-Type": "application/xml"},
+            )
+            resp.raise_for_status()
             root = ET.fromstring(resp.text)
-        except ET.ParseError as exc:
-            raise Yun139Error(f"刷新令牌返回内容无法解析: {resp.text[:200]}") from exc
-
-        ret = root.findtext("return")
-        if ret != "0":
-            desc = root.findtext("desc") or "未知错误"
-            raise Yun139Error(f"刷新令牌失败: {desc}")
-        new_token = root.findtext("token")
-        if not new_token:
-            raise Yun139Error("刷新令牌响应中缺少 token")
-
-        self.authorization = base64.b64encode(
-            f"{prefix}:{account}:{new_token}".encode("utf-8")
-        ).decode("utf-8")
-        return True
+            ret = root.findtext("return")
+            if ret != "0":
+                desc = root.findtext("desc") or "未知错误"
+                raise Yun139Error(f"刷新令牌失败: {desc}")
+            new_token = root.findtext("token")
+            if not new_token:
+                raise Yun139Error("刷新令牌响应中缺少 token")
+        except Exception as exc:
+            # 刷新没成功 —— 但**这不代表令牌不能用了**。
+            # 只要它还没到点，就接着用；网络抖动不该演变成"播放失败"。
+            left = remain / 1000
+            logger.warning(
+                "令牌刷新未成功（%s: %s），但令牌本身还剩 %.0f 天，继续使用",
+                type(exc).__name__, str(exc)[:120], left / 86400)
+            return False
+        else:
+            self.authorization = base64.b64encode(
+                f"{prefix}:{account}:{new_token}".encode("utf-8")
+            ).decode("utf-8")
+            return True
 
     # ------------------------------------------------------------------
     # 底层请求
@@ -440,7 +487,15 @@ class Yun139Client:
         """校验凭据、必要时刷新令牌，并查询各云的接入地址。"""
         if not self.authorization and self.mail_cookies:
             self.login_with_cookies()
-        self.refresh_token()
+        try:
+            self.refresh_token()
+        except Yun139Error:
+            # 【v2.2.23】令牌真过期了 —— 别直接死，先用 Cookie 兜底重登一次。
+            # 以前只有"令牌为空"才走 Cookie 登录，导致一条有值但过期的令牌
+            # 是彻底死路（用户只能手动重填）。现在过期也能自愈。
+            if not self._relogin_with_cookies():
+                raise
+            logger.info("令牌已过期，已用邮箱 Cookie 重新登录获取新令牌")
 
         resp = self._post(
             "https://user-njs.yun.139.com/user/route/qryRoutePolicy",
@@ -469,6 +524,21 @@ class Yun139Client:
         if self.cloud_type in ("group", "family") and not self.group_host:
             raise Yun139Error("未能获取群组/家庭云接入地址")
         return self
+
+    def _relogin_with_cookies(self):
+        """令牌失效时用邮箱 Cookie 重新登录换一条新令牌。
+
+        【v2.2.23】抽出来给 init() 兜底用。没有配 Cookie 时返回 False ——
+        调用方据此决定是抛错还是放行，**绝不能因为"没配 Cookie"就崩**。
+        """
+        if not self.mail_cookies:
+            return False
+        try:
+            self.login_with_cookies()
+            return True
+        except Exception as exc:
+            logger.warning("用邮箱 Cookie 重新登录失败: %s", str(exc)[:160])
+            return False
 
     def login_with_cookies(self):
         """用 139 邮箱 Cookie 免密码换取 Authorization（需含 Os_SSo_Sid 与 RMKEY）。"""
