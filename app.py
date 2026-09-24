@@ -100,15 +100,7 @@ CAS_TEMP_GRACE = 120
 #
 # 代价：停止播放后临时文件会多留半小时才清掉（一部片子一份，不会堆积）。
 # 相比"看到一半被打回起点"，这个代价可以接受。
-#
-# 【v2.2.23 —— 再放宽到 45 分钟】
-# 30 分钟这个值算错了账：它按"直链 900 秒"来估，可**真正在用文件的不是
-# 直链，是播放器**。播放器可以暂停十几分钟再继续（暂停期间一个请求都不发，
-# 文件不会被续期），也可以把一条 12 分钟的链一直用到它到期为止。
-# 只要文件比"链到期 + 播放器继续用"这两段加起来短，它就会成为先垮的那一环。
-# 45 分钟 = 12 分钟链寿命的将近 4 倍，把暂停的余量也算进去了。
-# 仍然一部片子只留一份，不会堆积。
-CAS_TEMP_MIN_TTL = 45 * 60
+CAS_TEMP_MIN_TTL = 30 * 60
 # 缓存里的直链多久探一次（秒）。
 #
 # 【v2.2.22】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
@@ -170,15 +162,10 @@ PROBE_SLOW_PAUSE = 300
 _probe_fail_streak = 0           # 连续「根本没探成」（超时/网络异常）
 _dead_streak = 0                 # 连续「刚还原的新链被判坏」
 _probe_fail_until = 0
-# 补救动作多久之内不重复做（秒）。
-#
-# 【v2.2.23】从 600 秒收到 120 秒，因为补救动作本身变了：
-# 以前补救 = 删文件 + 重新秒传（贵，必须压着频率，600 秒可以理解）；
-# 现在补救 = **对同一文件重签一条链**（便宜、幂等、不动文件）。
-# 既然不再有"还原风暴"的风险，600 秒的冷却就只剩下副作用了 ——
-# 它会让一条真坏掉的链在 10 分钟里反复被交出去，用户干等。
-# 120 秒足够挡住高频重试，又不至于把真问题拖成长痛。
-CAS_VERIFY_RETRY_COOLDOWN = 120
+# 「删掉重还原」的补救多久之内不重复做（秒）。万一 CDN 压根不接受 Range
+# 探测（每条链都回 4xx），没有这个冷却就会每次换链都白搭一次秒传，
+# 换集直接慢一倍 —— 真遇到这种情况，认赔一次比一直赔划算。
+CAS_VERIFY_RETRY_COOLDOWN = 600
 _verify_retried = {}
 
 # 一次 Range 探测的结论
@@ -324,6 +311,41 @@ def _client_key(cfg):
                     ("authorization", "cloud_type", "cloud_id", "username"))
 
 
+def _persist_refreshed_auth(client, cfg):
+    """把 client 上刷新出来的新令牌写回 config.json。
+
+    【v2.2.23 —— 修「令牌莫名失效、重启后回到旧令牌」的根治点】
+
+    病根：refresh_token() 拿到新令牌后只写在 client 对象上（内存），
+    **从来没有落过盘**。于是：
+
+        刷新成功 → 新令牌（30 天）只在内存
+            ↓
+        容器重启 / 客户端缓存过期重建 → 内存清空
+            ↓
+        重新读 config.json → 还是那条旧的、可能已经过期的令牌
+            ↓
+        「Authorization 已过期」→ 用户只能手动重填 → 又能用一阵 → 再来一轮
+
+    用户反馈"令牌周期性失效、手动重填又好了"就是这个循环。
+    用户拿 OpenList 对比说"它一个旧令牌能用几个月"—— 差别就在于
+     OpenList 有 `op.MustSaveDriverStorage(d)`，我们缺这一步。
+
+    只在**确实变了**的时候写盘，避免每次请求都写文件。
+    """
+    new_auth = (getattr(client, "authorization", "") or "").strip()
+    if not new_auth or new_auth == (cfg.get("authorization") or "").strip():
+        return False
+    cfg["authorization"] = new_auth
+    try:
+        save_config(cfg)
+        app.logger.info("令牌已续期并写回配置（重启后不会再退回旧令牌）")
+        return True
+    except OSError as exc:
+        app.logger.warning("令牌续期后写回配置失败: %s", exc)
+        return False
+
+
 def get_client(cfg):
     """取缓存好的 client；没有就用当前配置新建并 init。
 
@@ -345,6 +367,8 @@ def get_client(cfg):
                 return entry[0]
         client = build_client(cfg)
         client.init()
+        # 【v2.2.23】init 里可能刷新了令牌 —— 立刻落盘，否则重启就白刷。
+        _persist_refreshed_auth(client, cfg)
         with _clients_lock:
             _clients[key] = (client, time.time())
             for k in [k for k in _clients if k != key]:   # 只留当前账号
@@ -1255,23 +1279,12 @@ def _cache_put(key, value):
 # 结论：与其去猜旧状态哪里坏了，不如**续播时把旧状态全部丢掉，
 # 走一条和全新播放一模一样的路**。状态空间直接坍缩，玄学无处藏身。
 RESUME_IDLE_GAP = 180      # 距上次来要链超过这么久 → 判为续播
-# 【v2.2.25】距上次**成功交链**不到这么久 → 绝不可能是续播（人家正在看）。
-#
-# 为什么需要它：Trace 兜底（无记录 + 起播请求 + 有痕迹 → 续播）会被
-# 播放器的缓冲请求反复触发。播放器缓冲时发 bytes=0-0，服务端有链在
-# 缓存里 —— 两个条件就齐了。而判成续播会清掉探测节流，导致探测真的
-# 打出去、海外线路探不到、误判坏链、换文件、**跳回起播点**。
-#
-# 75 秒的取值依据：正常播放中，播放器每隔几秒到几十秒就要一次链
-# （诊断里看到 1~5 秒一次）；跨过 75 秒还没人来，才够得上"停过一阵"。
-# 真续播通常是几十分钟到隔夜，离 75 秒远得很，不会被误伤。
-RESUME_RECENT_SERVED = 75
 _last_served = {}          # file_id -> 上次成功交链的时刻
 _last_served_lock = threading.Lock()
 # 每个片子**每一次**来请求的时刻（不管成没成）。用来算「距上次请求隔了多久」——
 # 这是判断「这次是续播还是播放中的 seek」最直接的证据。
 #
-# 【v2.2.22】这份记录**落盘**。
+# 【v2.2.23】这份记录**落盘**。
 # 起因：用户升级（重建容器）后马上播第 135 集，服务端却判成了「新播」——
 # 因为它重启后内存里空空如也，以为这部片子从没播过。而判续播的唯一依据
 # 就是这个时间戳，它一丢，续播判定就整个失效。
@@ -1365,35 +1378,16 @@ def _mark_served(file_id):
 def _is_playback_start():
     """这条请求是不是「一次播放会话的开头」。
 
-    【v2.2.25 关键修复 —— 原来的判据把「播放中的缓冲请求」也放行了】
+    播放器起播时发的第一条请求，要么不带 Range，要么就是 bytes=0-0
+    （只问文件大小，不取数据）。这两种都没有真实的数据偏移，是
+    「会话开始」的标志。
 
-    以前这里把 `bytes=0-0` / `bytes=0-1` 也算「起播」。理由是"它们
-    没有真实数据偏移，说明会话刚开始"。**这个理由是错的。**
-
-    `bytes=0-0` 是 HTML5 播放器**在播放全程反复发**的一种请求：它想
-    知道文件有多大、能不能 seek，所以每次重新缓冲、每次切清晰度、
-    每次 seek 之后都会来一条。它跟"起播"长得一模一样，但**含义完全
-    不同**。
-
-    它进了「起播」名单，就给了 Trace 兜底（见 _is_resume 第二条）一个
-    随时可触发的入口 —— 播放器每缓冲一次，服务端就判一次「续播」，
-    而判成续播会**清掉探测节流**（见 _get_cas_link_inner 的 resume 分支），
-    于是下一次探测真的打了出去。海外服务器跨国际线路探国内 CDN
-    经常探不到 → 误判成坏链 → 重建/换文件 → **播放器手上那条链当场
-    失效 → 跳回起播点**。
-
-    用户实测（斗破苍穹 S00E02，16:45 那一串）与之完全吻合：
-    09 秒、11 秒、15 秒一路正常拉到 20MB，**16 秒突然来一条
-    `bytes=0-0` 被判成「续播」**，紧接着就出事。
-
-    现在只认真正的会话开头：**完全不带 Range**（首条请求），或
-    `bytes=0-`（明确表示"从 0 开始取到底"）。
-    `bytes=0-0` / `bytes=0-1` 是探测，不是起播，一律不算。
+    【v2.2.23 新增】用来把「续播的第一条请求」从一堆请求里认出来。
     """
     rng = (request.headers.get("Range") or "").strip().lower()
     if not rng:
         return True
-    return rng == "bytes=0-"
+    return rng in ("bytes=0-0", "bytes=0-1", "bytes=0-")
 
 
 _resume_why = threading.local()   # 这次请求的续播判定依据（"gap" / "trace"）
@@ -1404,7 +1398,7 @@ def _has_server_trace(file_id, use_cas):
 
     痕迹 = 链接缓存里还留着它的直链，或者还有它的还原会话 / 保护名单。
 
-    【v2.2.22 新增】意义：真·第一次播放的片子，服务端是**空空如也**的；
+    【v2.2.23 新增】意义：真·第一次播放的片子，服务端是**空空如也**的；
     反过来，服务端有痕迹却查不到"上次访问记录"，说明记录丢了
     （容器重建、配置卷没挂上、诊断清过）—— 这时候播放器带着记忆点
     回来，十有八九是**续播**，不能当成新播。
@@ -1428,7 +1422,7 @@ def _has_server_trace(file_id, use_cas):
 def _is_resume(file_id, gap=None, use_cas=False):
     """这次请求是不是「播到一半退出去、过了一阵子回来接着播」。
 
-    【v2.2.22 —— 用户实测纠正】
+    【v2.2.23 —— 用户实测纠正】
     以前这里是「Range 起点必须大于 0」**且**「距上次交链超过 180 秒」，
     两个条件都要满足。用户拿真实数据证明这个判据是坏的。
 
@@ -1439,7 +1433,7 @@ def _is_resume(file_id, gap=None, use_cas=False):
       * 拖进度条：几秒前刚来过（连续播放中）；
       * 续播：几十分钟、几小时、隔夜（停过一阵子）。
 
-    【v2.2.22 —— 补第三条兜底：无记录但有痕迹】
+    【v2.2.23 —— 补第三条兜底：无记录但有痕迹】
     只看间隔还有个大漏洞，用户实测踩中（第 191 集）：
 
         16:21:57  续播请求  Range=(无)  距上次=**无记录**  → 判成「新播」
@@ -1467,32 +1461,8 @@ def _is_resume(file_id, gap=None, use_cas=False):
     if gap and gap > RESUME_IDLE_GAP:
         _resume_why.reason = "gap"
         return True
-    # 二、没记录：有痕迹 + 起播请求 + **最近没刚交过链** → 也是续播
-    #
-    # 【v2.2.25 新增第三道闸：刚交过链就不是续播】
-    #
-    # 前两道闸（起播请求 + 服务端有痕迹）挡不住"播放中的缓冲请求"：
-    # 播放器缓冲时发的 bytes=0-0，在服务端看来跟起播没区别，而服务端
-    # 当然有痕迹（链就在缓存里）。两个条件同时命中 → 判成续播 →
-    # 清掉探测节流 → 探测误判 → 换文件 → **跳回起播点**。
-    #
-    # 真·续播有一个铁定的特征：**这个人已经很久没来要过链了**。
-    # 而"刚交过链"（几十秒内）说明人家正在看着呢，这是同一个播放会话
-    # 里的一次缓冲，绝不可能是续播。
-    #
-    # 用 _last_served（上次成功交链的时刻）来判：它只在真正把链交出去
-    # 之后才写，比 _last_seen（每个请求都写）更能代表"有人在看"。
+    # 二、没记录：有痕迹 + 起播请求 → 也是续播
     if not gap and _is_playback_start() and _has_server_trace(file_id, use_cas):
-        with _last_served_lock:
-            served = _last_served.get(file_id)
-        since = int(time.time() - served) if served else -1
-        if served and since < RESUME_RECENT_SERVED:
-            # 刚交过链 → 人家正在看，这不是续播，是同一会话里的缓冲请求
-            app.logger.info(
-                "trace 兜底被拦下（%d 秒前刚交过链，属同一播放会话）file=%s",
-                max(since, 0), file_id[:12])
-            _resume_why.reason = ""
-            return False
         app.logger.info(
             "续播判定兜底命中（无记录但有痕迹）file=%s cas=%s",
             file_id[:12], use_cas)
@@ -1545,7 +1515,7 @@ _play_locks_lock = threading.Lock()
 _play_meta = threading.local()
 # 已知的还原文件大小：file_id -> 字节数。
 #
-# 【v2.2.22】为什么要记这个：用户反馈「第 138 集播到 12 分钟左右，
+# 【v2.2.23】为什么要记这个：用户反馈「第 138 集播到 12 分钟左右，
 # 几秒钟之内连跳两三次回到起点」，而其他集都正常。
 # 这个特征（只有某一片、在某个时间点、短时间内反复跳）指向一种可能：
 # **播放器以为这一集还有内容，但文件其实已经到末尾了** —— 它请求一个
@@ -1623,7 +1593,7 @@ def _get_cas_link_inner(client, cfg, file_id, cas_name, resume=False):
         # 留着它，清扫才知道该绕开谁。
         # 这样续播照样拿到全新还原的文件，但不会顺手删掉播放器可能还在用的旧文件。
         #
-        # 【v2.2.22 —— 只丢"探测节流/补救冷却"，**不再丢链接本身**】
+        # 【v2.2.23 —— 只丢"探测节流/补救冷却"，**不再丢链接本身**】
         #
         # 以前这里还有一句 `_link_cache.pop(key, None)`：只要判成续播，
         # 就把手上那条链扔掉、重新签一条。当时想法是"续播当全新播放处理"。
@@ -1650,7 +1620,7 @@ def _get_cas_link_inner(client, cfg, file_id, cas_name, resume=False):
         cached = _link_cache.get(key)
     if cached and len(cached) >= 3 and cached[1] > now:
         url, expire, temp_id = cached[0], cached[1], cached[2]
-        # 【v2.2.22】"还剩多少命"要留够，否则不能给它。
+        # 【v2.2.23】"还剩多少命"要留够，否则不能给它。
         # 一个请求过来时，播放器是要**拿着这条链接着播下去**的，
         # 不是只用这一下。剩 30 秒就交出去，等于 30 秒后必然出事。
         remain = expire - now
@@ -1663,7 +1633,7 @@ def _get_cas_link_inner(client, cfg, file_id, cas_name, resume=False):
                            int(expire - now + CAS_TEMP_GRACE),
                            CAS_TEMP_MIN_TTL))
             return url
-        # 【v2.2.22】链"快到期" → 换链，但**不换文件**。
+        # 【v2.2.23】链"快到期" → 换链，但**不换文件**。
         #
         # 这是本次最关键的改动之一。以前的写法是"清缓存 → 走全新播放"，
         # 而"全新播放"会**重新秒传出一个新文件**，旧副本随之被清扫。
@@ -1690,23 +1660,6 @@ def _get_cas_link_inner(client, cfg, file_id, cas_name, resume=False):
                 app.logger.info("链只剩 %d 秒，对同一文件重签链接（%s）",
                                 max(int(remain), 0), cas_name)
                 return fresh
-            # 【v2.2.23】重签失败也**绝不换文件**。
-            #
-            # 走到这里说明链快到期、想给它续一条，但重签没成功。旧写法是
-            # 放任往下走 → fetch_link 全新秒传 → **新文件顶替旧文件** →
-            # 播放器手上那条链接指向的文件被清扫掉 → 跳回起播点。
-            # 为了几秒钟的"链快到期"就换文件，代价是用户跳回起点，完全不值。
-            #
-            # 正确做法：把旧链照旧交出去（它这会儿**还没过期**，还能用），
-            # 同时把临时文件的寿命往后延，别让文件比链先垮。等它真到期了、
-            # 下一个请求再来时，重签还有一次机会。
-            restorer.schedule_delete(
-                temp_id, delay=max(int(restorer.temp_ttl or 0),
-                           int(CAS_TEMP_MIN_TTL), CAS_TEMP_GRACE + 300))
-            app.logger.info(
-                "重签失败，仍交出旧链（还剩 %d 秒）并延长文件寿命，不换文件: %s",
-                max(int(remain), 0), cas_name)
-            return url
         # 探测说这条链废了（多半是用户在云盘里手动删了临时文件）→ 想重建。
         # 但重建必须受冷却约束：万一「探不到」其实是我们自己到 CDN 的路
         # 不通（链对播放器是好的），没有冷却就会变成「来一个请求还原一份」
@@ -1742,62 +1695,17 @@ def _get_cas_link_inner(client, cfg, file_id, cas_name, resume=False):
                 _known_size[file_id] = int(size)
     # 注意 and 的短路：只有确实探到坏链、且熔断器没跳闸，才会走补救
     if _fresh_link_broken(key, url, cas_name) and _verify_retry_allowed(key):
-        # 【v2.2.23 —— 只换链，绝不换文件】
-        #
-        # 这里以前是 `delete_quietly(temp_id)` + `fetch_link()` —— 把刚还原
-        # 的文件删掉、再秒传一个新的出来。这是「播到一半跳回起播点」在
-        # 302 架构下的**最后一环**，也是升级后问题反而更严重的原因：
-        #
-        #   探测判死 → 删文件 → 重建新文件 → 旧文件（播放器正攥着它的链）
-        #   当场变死链 → 播放器取不到数据 → 跳回起点。
-        #
-        # 而在甲骨文这种海外服务器上，「探测判死」**多半是误判**：服务器
-        # 跨国际线路去看国内 CDN，探不到是常态（诊断里那种 7.8 秒的
-        # 「换了新文件」就是它）。也就是说，一个本来就是好的文件，被我们
-        # 自己的探测给删了。
-        #
-        # 铁律：**刚还原出来的文件不可能是坏的**。既然要重建的只是"链接"
-        # 这一层，那就只重建链接 —— 对**同一个临时文件**重签一条新链。
-        # 文件原地不动，播放器手上那条旧链也不会因为文件被删而立刻断。
-        # 这跟上面「链快到期」那条路是同一个动作，重试一次并不过分。
-        fresh = ""
-        try:
-            fresh = restorer.refresh_link(temp_id)
-        except Exception as exc:
-            app.logger.info("重签链接失败（%s）: %s", cas_name, exc)
-        if fresh:
-            url = fresh
-            _play_meta.restored = False       # 同一个文件，没换
-            app.logger.info(
-                "直链探测判坏，已对同一文件（%s）重签新链，未删文件: %s",
-                temp_id, cas_name)
-        else:
-            # 【v2.2.25 —— 这里也**不删文件**，把最后一条会跳回的路堵死】
-            #
-            # v2.2.23 把"探测判坏"从"删文件重建"改成了"对同一文件重签"，
-            # 但重签失败时**仍然**走了 delete_quietly + fetch_link。这是
-            # 302 架构下最后一个能造成"跳回起播点"的出口：
-            #
-            #   重签失败（海外线路抖动、云盘接口短暂抽风都会）→ 删掉文件
-            #   → 播放器手上那条链当场变死 → 跳回 0 秒
-            #
-            # 而"重签失败"根本**不能证明文件没了**：refresh_link 只是去
-            # 要一条新签名，它失败可能纯粹是网络抖了一下。拿它当"文件已
-            # 死"的证据，代价却是用户跳回起点，完全不成比例。
-            #
-            # 正确做法：**照旧把手上这条链交出去**（它这会儿还没过期，
-            # 而且我们刚刚才验过——能验到坏说明至少探到过响应），同时
-            # 把文件寿命往后延。等下一个请求再来，重签还有机会；
-            # 真到链过期了，下面"链快到期/已坏死"的分支会接管。
-            #
-            # 一句话：**宁可交一条存疑的链，也绝不删文件。**
-            _play_meta.restored = False       # 同一个文件，没换
-            app.logger.warning(
-                "重签链接失败（%s），仍交出旧链并延长文件寿命，不删文件重建",
-                cas_name)
-            restorer.schedule_delete(
-                temp_id, delay=max(int(restorer.temp_ttl or 0),
-                                   int(CAS_TEMP_MIN_TTL), CAS_TEMP_GRACE + 300))
+        # 这条链根本用不了：新还原的文件在 CDN 侧还没同步，或者复用的实体
+        # 其实已经不在了（取直链接口对不存在的文件照样签发 URL，不探一下
+        # 就会把死链发给播放器 —— 表现是「一直加载中，返回重播才正常」）。
+        # 播放器 follow 302 后就钉在这条 URL 上了，所以必须现在就补救。
+        app.logger.warning("刚取到的直链不可用（%s），删掉重还原一次", cas_name)
+        restorer.delete_quietly(temp_id)     # 这条确实是坏的，明确删掉
+        # 但**不** forget_session：这一条要重建，不代表这部片子的**其它**
+        # 副本也是坏的。留着登记表，重建触发清扫时才能绕开它们 ——
+        # 那些副本可能正被播放器用着（用户手上可能开着好几个播放器实例）。
+        url, size, temp_id, real_name, restored = restorer.fetch_link(
+            file_id, cas_name)
     expire = _link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL)
     # 临时文件必须活过缓存：缓存失效后再宽限 CAS_TEMP_GRACE 秒。
     # 不能只看 cas_temp_ttl —— 直链 15 分钟后才过期，这期间播放器拿着旧直链
@@ -1832,9 +1740,19 @@ def _friendly_error(exc):
         「获取直链失败: 502 Server Error: Bad Gateway for url: https://...」
     —— 又长又吓人，还不知道该怎么办。移动云盘的接口偶尔会返回 502/超时，
     这种情况**重试一下通常就好**，所以直接把话说清楚。
+
+    【v2.2.23】令牌那条专门分清楚。以前不管什么原因都报「已过期，请重新
+    获取」，把用户骗去重新填令牌 —— 而实测中令牌明明还有 15 天有效期，
+    真正的问题是刷新接口在跨国际线路上抖了一下。报错说错原因，等于把
+    用户引到错误的处置动作上。
     """
     msg = str(exc)
     low = msg.lower()
+    if "authorization" in low and ("过期" in msg or "expired" in low):
+        return ("令牌已到期，且自动续期未成功。请重新获取令牌；"
+                "若已配置邮箱 Cookie，程序会尝试自动重新登录。")
+    if "刷新令牌" in msg:
+        return f"令牌续期接口返回异常：{msg[:160]}（令牌本身可能仍然可用，请稍后重试）"
     if "bad gateway" in low or "502" in msg or "503" in msg:
         return "获取直链失败：移动云盘接口暂时不可用（502/503）。请稍等几秒重试。"
     if "timed out" in low or "timeout" in low or "超过本次播放的等待上限" in msg:
@@ -1859,6 +1777,8 @@ def _resolve_play_url(cfg, file_id, cas_name, use_cas, resume=False):
                 drop_client(cfg)
                 client = build_client(cfg)
                 client.init()
+                # 【v2.2.23】重试这一搏同样可能刷出/换回新令牌，一样要落盘。
+                _persist_refreshed_auth(client, cfg)
             url = (_get_cas_link(client, cfg, file_id, cas_name, resume)
                    if use_cas else _get_link(client, file_id, resume))
             break
@@ -1884,7 +1804,7 @@ def _resolve_play_url(cfg, file_id, cas_name, use_cas, resume=False):
 def _invalidate_link(file_id, use_cas, cfg=None):
     """丢掉缓存的直链，逼下一次请求换一条新的。
 
-    【v2.2.22】这里以前还会 forget_session，同样是那个"顺手把文件花名册
+    【v2.2.23】这里以前还会 forget_session，同样是那个"顺手把文件花名册
     清空 → 清扫把旧副本全删掉 → 播放器手上的链接变死链"的坑。
     只丢链接缓存就够了：下一次请求会自动走"全新秒传"。
     """
@@ -2077,7 +1997,7 @@ def direct_link(file_id):
 _DIAG_MAX = 40
 _diag = collections.deque(maxlen=_DIAG_MAX)
 _diag_lock = threading.Lock()
-# 【v2.2.22】诊断记录**落盘**。
+# 【v2.2.23】诊断记录**落盘**。
 # 用户反馈：升级（重建容器）后之前的记录全没了，想跟升级前对比都做不到。
 # 记录只放内存里就是这个下场 —— 而"升级前后对比"恰恰是排查这类问题时
 # 最有用东西。落盘后可以跨重启保留。
@@ -2619,7 +2539,7 @@ def _warm_cdn():
 
 
 def _keep_warm_loop():
-    # 【v2.2.22】启动后**立刻**热一遍，不等第一个间隔。
+    # 【v2.2.23】启动后**立刻**热一遍，不等第一个间隔。
     # 用户实测：容器刚重建时点播放要 8.4 秒，跑了一会儿之后只要 5.3 秒 ——
     # 差的 3 秒全是"从零建连接"。而保温线程原来要等 240 秒才第一次跑，
     # 正好把用户升级后第一次播放晾在最冷的时刻。
@@ -2651,67 +2571,9 @@ def start_keep_warm():
                      daemon=True).start()
 
 
-# 【v2.2.24】临时目录自动清扫
-# 为什么需要：原来只有 _pending 内存字典 + reaper 线程负责删临时文件，
-# 进程一重启 _pending 就清空，重启前登记的临时文件从此无人认领、永远残留。
-# 用户实测残留过一个 678MB 的 TEMP_xxx.mkv。这里做兜底：
-#   ① 启动后立刻扫一次，专门回收「上次进程遗留」的孤儿；
-#   ② 之后每小时扫一次，清理创建超过 AUTO_PURGE_MIN_AGE 秒的残留。
-# 定时清扫只按「文件年龄」判定，不动 _pending 正在保护的新文件，因此不会误删正在播放的。
-TEMP_PURGE_INTERVAL = int(os.environ.get("TEMP_PURGE_INTERVAL", 3600))
-TEMP_PURGE_MIN_AGE = int(os.environ.get("TEMP_PURGE_MIN_AGE", 3600))
-_temp_purge_started = False
-
-
-def _purge_temp_once(reason, max_age):
-    """按账号逐个清扫临时目录；任何异常都吞掉，不影响主流程。"""
-    try:
-        cfg = load_config()
-        if not cfg.get("authorization"):
-            return
-        if not cfg.get("cas_enabled", True):
-            return
-        client = get_client(cfg)
-        rest = get_restorer(cfg, client)
-        if not rest.find_temp_dir():
-            return  # 还没建过临时目录，没什么可清的
-        removed = rest.purge_temp_dir(max_age=max_age)
-        if removed:
-            app.logger.info("临时目录自动清扫[%s]：清理 %s 个残留文件", reason, removed)
-        else:
-            app.logger.info("临时目录自动清扫[%s]：无残留", reason)
-    except Exception as exc:
-        app.logger.info("临时目录自动清扫[%s]跳过一轮：%s", reason, exc)
-
-
-def _temp_purge_loop():
-    # 第一次：无条件清空（max_age=0）——进程刚起来，临时目录里的东西
-    # 必然是上一个进程留下的，且此刻不存在任何正在播放的会话，尽管清。
-    _purge_temp_once("启动兜底", 0)
-    while True:
-        try:
-            time.sleep(TEMP_PURGE_INTERVAL)
-            # 之后按年龄清，避免误删刚生成、可能还在播的文件
-            _purge_temp_once("定时", TEMP_PURGE_MIN_AGE)
-        except Exception as exc:
-            app.logger.info("临时目录清扫线程异常（忽略）: %s", exc)
-
-
-def start_temp_purge():
-    """启动临时目录自动清扫线程（只起一次）。"""
-    global _temp_purge_started
-    with _clients_lock:
-        if _temp_purge_started:
-            return
-        _temp_purge_started = True
-    threading.Thread(target=_temp_purge_loop, name="139strm-temp-purge",
-                     daemon=True).start()
-
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8025))
     threading.Thread(target=_task_scheduler_loop, name="139strm-task-scheduler",
                      daemon=True).start()
     start_keep_warm()
-    start_temp_purge()
     app.run(host="0.0.0.0", port=port, threaded=True)
